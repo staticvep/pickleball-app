@@ -392,8 +392,31 @@
     gap:10px;
     padding: 10px 12px;
     border-bottom: 1px solid var(--border);
+    background: var(--card);
   }
   .queue-row:last-child{ border-bottom: none; }
+  .drag-handle{
+    flex-shrink: 0;
+    width: 22px;
+    height: 32px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color: var(--text-muted);
+    font-size: 18px;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .drag-handle:active{ cursor: grabbing; }
+  .draggable-row.dragging{
+    opacity: 0.85;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.18);
+    border-radius: 8px;
+    position: relative;
+    cursor: grabbing;
+  }
   .queue-pos{
     font-size: 13px;
     color: var(--text-muted);
@@ -475,6 +498,82 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
   }
+
+  .history-list{
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow-y: auto;
+    overflow-x: hidden;
+    background: var(--card);
+    max-height: 40vh;
+  }
+  .history-row{
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .history-row:last-child{ border-bottom: none; }
+  .history-meta{
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-bottom: 3px;
+  }
+  .history-teams{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    flex-wrap:wrap;
+  }
+  .history-team{ font-weight: 600; }
+  .history-vs{ color: var(--text-muted); font-weight: 400; }
+
+  .lookup-summary{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px;
+    margin-bottom: 10px;
+    font-size: 13px;
+  }
+  .lookup-summary .big-num{
+    font-size: 20px;
+    font-weight: 800;
+    color: var(--court-green);
+  }
+  .freq-table{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .freq-row{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  .freq-row:last-child{ border-bottom:none; }
+  .freq-row.head{
+    background: var(--bg);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+  }
+  .freq-name{ flex:1; }
+  .freq-num{ width: 46px; text-align:center; font-weight:700; }
+  .freq-badge{
+    font-size: 10px;
+    font-weight: 800;
+    padding: 2px 6px;
+    border-radius: 6px;
+    text-transform: uppercase;
+  }
+  .freq-badge.teammate{ background: rgba(15,179,155,0.15); color: var(--kitchen-teal); }
+  .freq-badge.opponent{ background: rgba(255,106,61,0.15); color: var(--sunset-orange); }
 </style>
 </head>
 <body>
@@ -608,6 +707,18 @@
     <div id="standingsWrap"></div>
   </div>
 
+  <div class="section">
+    <div class="section-head">
+      <h2>Match history</h2>
+    </div>
+    <div class="add-row" style="margin-bottom:10px;">
+      <select id="historyPlayerFilter" style="flex:1; width:auto;">
+        <option value="">All players — show game log</option>
+      </select>
+    </div>
+    <div id="historyWrap"></div>
+  </div>
+
 </div>
 
 <script>
@@ -644,6 +755,8 @@
   const restCountEl = document.getElementById('restCount');
   const restEmptyHintEl = document.getElementById('restEmptyHint');
   const standingsWrap = document.getElementById('standingsWrap');
+  const historyWrap = document.getElementById('historyWrap');
+  const historyPlayerFilter = document.getElementById('historyPlayerFilter');
   const statChecked = document.getElementById('statChecked');
   const statWaiting = document.getElementById('statWaiting');
   const statResting = document.getElementById('statResting');
@@ -952,16 +1065,197 @@
     return { slots, levels, pairs, lockedGroup: false };
   }
 
-  function fillCourts(onlyIndex){
-    courts.forEach((court, i) => {
-      if(court) return;
-      if(onlyIndex !== undefined && i !== onlyIndex) return;
-      const takenIdx = peekNextFoursome();
-      if(!takenIdx) return;
-      const collectedUnits = takenIdx.map(idx => queue[idx]);
-      takenIdx.slice().reverse().forEach(idx => queue.splice(idx, 1));
-      courts[i] = unitsToCourtShape(collectedUnits);
+  // justFinishedBatches holds recent "just came off a court" groups, oldest first. Only
+  // names in the most recent couple of batches count as needing a rest — older batches age
+  // out automatically. Without this decay, someone who keeps getting passed over would stay
+  // marked "just finished" forever and the set would eventually swallow the whole roster,
+  // which defeats both the rest-cooldown and the co-occurrence spreading below.
+  let justFinishedBatches = [];
+  const JUST_FINISHED_BATCH_LIMIT = 2; // how many recent finish-events still count as "needs a rest"
+
+  function isJustFinished(name){
+    return justFinishedBatches.some(batch => batch.has(name));
+  }
+
+  function addJustFinishedBatch(names){
+    justFinishedBatches.push(new Set(names));
+    while(justFinishedBatches.length > JUST_FINISHED_BATCH_LIMIT){
+      justFinishedBatches.shift();
+    }
+  }
+
+  let coOccurrence = {}; // key: sorted "NameA|NameB", value: how many times they've shared a court at all (teammates or opponents) — used to spread people across the whole pool over time, not just avoid immediate repeats
+
+  function coKey(a, b){
+    return [a, b].sort().join('|');
+  }
+  function recordCoOccurrence(names){
+    for(let i = 0; i < names.length; i++){
+      for(let j = i + 1; j < names.length; j++){
+        const key = coKey(names[i], names[j]);
+        coOccurrence[key] = (coOccurrence[key] || 0) + 1;
+      }
+    }
+  }
+  function coCountSum(names, candidateName){
+    // how "used up" a candidate is relative to the other 3 people already chosen
+    return names.reduce((sum, n) => sum + (coOccurrence[coKey(n, candidateName)] || 0), 0);
+  }
+
+  let lastCourtOccupants = [null, null]; // the previous foursome (by name) seated on each court, used to detect an instant self-refill
+
+  // Picks who fills a court using weighted-random selection instead of always taking the
+  // Tracks how many times each waiting person has been in the front-of-line pool for an
+  // opening but wasn't picked. A fresh person (streak 0) has a baseline ~50% relative
+  // weight; anyone who's already been passed over at least once gets bumped to a much
+  // higher ~72.5% relative weight so they're strongly favored next time — but never
+  // guaranteed, so the pool keeps genuinely shuffling instead of settling into a new rigid
+  // pattern. The streak resets to 0 the moment someone is actually picked.
+  let missStreak = {};
+
+  function missWeight(name){
+    const streak = missStreak[name] || 0;
+    return streak > 0 ? 0.725 : 0.5;
+  }
+
+  // Picks 4 people to fill a court from the front slice of the waiting line (up to the
+  // first 8 eligible singles), weighted by how many times they've already been passed over.
+  // This directly replaces the earlier co-occurrence-based approach: instead of trying to
+  // track who's played with whom and favor fresh combinations, it simply randomizes WHICH 4
+  // of the next 8 in line get called up, so the same rigid front-4 group doesn't mechanically
+  // form every single time — while still guaranteeing nobody drifts backward forever, since
+  // being missed once sharply raises the odds of being picked next.
+  function pickFourFromFrontPool(eligiblePool){
+    const pool = eligiblePool.slice(0, 8); // only the front 8 eligible singles are in play
+    const chosen = [];
+    let remaining = pool.slice();
+    for(let seat = 0; seat < 4 && remaining.length > 0; seat++){
+      const weighted = remaining.map(entry => ({ entry, weight: missWeight(entry.u.names[0]) }));
+      const totalWeight = weighted.reduce((sum, w) => sum + w.weight, 0);
+      let roll = Math.random() * totalWeight;
+      let pick = weighted[weighted.length - 1].entry;
+      for(const w of weighted){
+        roll -= w.weight;
+        if(roll <= 0){ pick = w.entry; break; }
+      }
+      chosen.push(pick);
+      remaining = remaining.filter(o => o.qi !== pick.qi);
+    }
+    // update streaks: everyone chosen resets to 0; everyone else in the front-8 pool who
+    // wasn't chosen this time gets their streak incremented (capped — no need to track past
+    // "already very likely")
+    const chosenNames = new Set(chosen.map(c => c.u.names[0]));
+    pool.forEach(entry => {
+      const name = entry.u.names[0];
+      if(chosenNames.has(name)){
+        missStreak[name] = 0;
+      } else {
+        missStreak[name] = Math.min((missStreak[name] || 0) + 1, 3);
+      }
     });
+    return chosen;
+  }
+
+  function fillCourts(onlyIndex){
+    const emptyCourtIndices = courts
+      .map((c, idx) => ({ c, idx }))
+      .filter(o => !o.c && (onlyIndex === undefined || o.idx === onlyIndex))
+      .map(o => o.idx);
+    if(emptyCourtIndices.length === 0) return;
+
+    for(const i of emptyCourtIndices){
+      if(courts[i]) continue;
+
+      // A locked pair or locked group of 4 at the front of strict FIFO order always takes
+      // priority and is never touched by the front-8 random pool — it's an explicit
+      // standing request from the facilitator.
+      const takenIdx = peekNextFoursome();
+      if(takenIdx){
+        const collectedUnits = takenIdx.map(idx => queue[idx]);
+        const hasLockedUnit = collectedUnits.some(u => u.type !== 'single');
+        if(hasLockedUnit){
+          takenIdx.slice().reverse().forEach(idx => queue.splice(idx, 1));
+          const finalNames = collectedUnits.flatMap(u => u.names);
+          recordCoOccurrence(finalNames);
+          const courtShape = unitsToCourtShape(collectedUnits);
+          logMatch(i, courtShape);
+          courts[i] = courtShape;
+          lastCourtOccupants[i] = new Set(courtShape.slots);
+          continue;
+        }
+      }
+
+      // Strict FIFO couldn't complete a foursome (e.g. a locked pair/group sits behind a
+      // couple of stray singles that can't reach 4 on their own). If the first locked unit
+      // anywhere in the queue is a group of 4, seat it now rather than leaving it stranded
+      // forever behind singles that can never complete without it.
+      const firstGroup4Idx = queue.findIndex(u => u.type === 'group4');
+      if(firstGroup4Idx !== -1){
+        const groupUnit = queue[firstGroup4Idx];
+        queue.splice(firstGroup4Idx, 1);
+        recordCoOccurrence(groupUnit.names);
+        const courtShape = unitsToCourtShape([groupUnit]);
+        logMatch(i, courtShape);
+        courts[i] = courtShape;
+        lastCourtOccupants[i] = new Set(courtShape.slots);
+        continue;
+      }
+
+      // All unlocked singles — draw 4 from the front-8 pool, weighted by miss streak.
+      const allSingles = queue.map((u, qi) => ({ u, qi })).filter(o => o.u.type === 'single');
+      const restedOnly = allSingles.filter(o => !isJustFinished(o.u.names[0]));
+      // The rest-cooldown protection (keeping someone out of the pool right after they
+      // finish) is valuable, but with a tight pool it can shrink the rested group down to
+      // exactly 4 — technically "enough to fill a court" but with zero actual choice left,
+      // which is what was silently recreating the same court composition every round. If
+      // the rested pool doesn't offer genuine selection room (fewer than 6), blend in
+      // just-finished people too rather than waiting for a full 8 — real mixing matters more
+      // here than a strict one-round rest guarantee for every single person every time.
+      let eligible = restedOnly.length >= 6 ? restedOnly : allSingles;
+      if(eligible.length < 4) continue; // not enough people waiting for a court yet
+
+      // Avoid an instant self-refill: if the only people available are exactly this court's
+      // own just-vacated group, and another court is still occupied (more people coming
+      // soon), hold this court open instead of reseating the same four immediately.
+      const prevOccupants = lastCourtOccupants[i];
+      if(prevOccupants){
+        const nonSelf = eligible.filter(o => !prevOccupants.has(o.u.names[0]));
+        const anotherOccupied = courts.some((c, ci) => ci !== i && c);
+        if(nonSelf.length < 4 && anotherOccupied) continue;
+      }
+
+      const chosen = pickFourFromFrontPool(eligible);
+      if(chosen.length < 4) continue;
+
+      chosen.slice().sort((a, b) => b.qi - a.qi).forEach(entry => {
+        const idx = queue.indexOf(entry.u);
+        if(idx !== -1) queue.splice(idx, 1);
+      });
+      const finalUnits = chosen.map(entry => entry.u);
+      const finalNames = finalUnits.flatMap(u => u.names);
+
+      recordCoOccurrence(finalNames);
+      const courtShape = unitsToCourtShape(finalUnits);
+      logMatch(i, courtShape);
+      courts[i] = courtShape;
+      lastCourtOccupants[i] = new Set(courtShape.slots);
+    }
+  }
+
+  // matchHistory is a chronological log of every foursome that's been seated on a court —
+  // this is what powers the match-history viewer so the facilitator can see exactly who
+  // played with/against whom and how often, instead of trusting the fairness logic blindly.
+  let matchHistory = [];
+  const MATCH_HISTORY_LIMIT = 500; // cap so a very long session doesn't grow this unbounded
+
+  function logMatch(courtIndex, courtShape){
+    matchHistory.push({
+      time: new Date().toISOString(),
+      court: courtIndex,
+      teamA: [courtShape.slots[0], courtShape.slots[1]],
+      teamB: [courtShape.slots[2], courtShape.slots[3]]
+    });
+    if(matchHistory.length > MATCH_HISTORY_LIMIT) matchHistory.shift();
   }
 
   function buildPreview(i){
@@ -978,7 +1272,11 @@
   function confirmPreview(i){
     if(!previews[i]) return;
     pushHistory();
-    courts[i] = previews[i];
+    const courtShape = previews[i];
+    recordCoOccurrence(courtShape.slots);
+    logMatch(i, courtShape);
+    courts[i] = courtShape;
+    lastCourtOccupants[i] = new Set(courtShape.slots);
     previews[i] = null;
     render();
   }
@@ -1076,21 +1374,45 @@
     render();
   }
 
+  // Inserts a requeuing unit at a randomized position within a window near the back of the
+  // line, instead of always the exact last slot. Strict "always append to the tail" FIFO is
+  // what causes a stable-sized pool to split into permanently separate "orbits": whoever
+  // starts next to each other in the queue stays next to each other on every lap forever,
+  // because the same block of people always requeues in the same relative block order.
+  // Randomizing the landing spot within a window near the back breaks that rigid structure
+  // so the pool actually mixes over time, while still keeping everyone roughly near the
+  // back — this scales with queue length, so it behaves reasonably whether there are 12
+  // people or 40.
+  function insertNearBack(unit){
+    const windowSize = Math.max(3, Math.min(queue.length, Math.ceil(queue.length / 2) + 2));
+    const earliestInsertPoint = Math.max(0, queue.length - windowSize);
+    const insertAt = earliestInsertPoint + Math.floor(Math.random() * (queue.length - earliestInsertPoint + 1));
+    queue.splice(insertAt, 0, unit);
+  }
+
   function finishCourtNoHistory(i){
     const court = courts[i];
     courts[i] = null;
+    if(court){
+      // mark everyone who was just on this court as needing a rest turn before being
+      // drawn again, regardless of whether they requeue (if requeue is off, this has no
+      // practical effect since they've left the rotation entirely anyway). This is tracked
+      // as a decaying batch, not a permanent set, so someone who keeps getting passed over
+      // doesn't stay "just finished" forever.
+      addJustFinishedBatch(court.slots);
+    }
     if(court && requeueToggle.checked){
       if(court.lockedGroup){
-        queue.push({ type: 'group4', names: court.slots.slice(), levels: court.levels.slice() });
+        insertNearBack({ type: 'group4', names: court.slots.slice(), levels: court.levels.slice() });
       } else {
         const pairedNames = new Set();
         court.pairs.forEach(pair => pair.forEach(n => pairedNames.add(n)));
         court.pairs.forEach(pair => {
           const levelsForPair = pair.map(n => { const j = court.slots.indexOf(n); return court.levels[j]; });
-          queue.push({ type: 'pair', names: pair, levels: levelsForPair });
+          insertNearBack({ type: 'pair', names: pair, levels: levelsForPair });
         });
         court.slots.forEach((name, idx) => {
-          if(!pairedNames.has(name)) queue.push({ type: 'single', names: [name], levels: [court.levels[idx]] });
+          if(!pairedNames.has(name)) insertNearBack({ type: 'single', names: [name], levels: [court.levels[idx]] });
         });
       }
     }
@@ -1109,6 +1431,106 @@
       queue.splice(idx, 1);
     }
     render();
+  }
+
+  function reorderQueue(fromIdx, toIdx){
+    if(fromIdx === toIdx) return;
+    pushHistory();
+    const [moved] = queue.splice(fromIdx, 1);
+    queue.splice(toIdx, 0, moved);
+    render();
+  }
+
+  // Pointer-based drag-and-drop (works reliably on touch as well as mouse, unlike native
+  // HTML5 drag events which are inconsistent on mobile browsers). The facilitator can freely
+  // drag any row — solo, locked pair, or locked group of 4 — to a new position in the line.
+  let dragState = null;
+
+  function wireDragAndDrop(){
+    const rows = Array.from(queueListEl.querySelectorAll('.draggable-row'));
+
+    rows.forEach(row => {
+      const handle = row.querySelector('.drag-handle');
+      handle.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        const startIdx = parseInt(row.getAttribute('data-idx'));
+        dragState = {
+          startIdx,
+          currentIdx: startIdx,
+          rowHeight: row.offsetHeight,
+          startY: e.clientY,
+          row
+        };
+        row.classList.add('dragging');
+        row.setPointerCapture && handle.setPointerCapture(e.pointerId);
+      });
+    });
+
+    function onPointerMove(e){
+      if(!dragState) return;
+      const deltaY = e.clientY - dragState.startY;
+      dragState.row.style.transform = `translateY(${deltaY}px)`;
+      dragState.row.style.zIndex = '10';
+
+      const allRows = Array.from(queueListEl.querySelectorAll('.draggable-row'));
+      const draggedRect = dragState.row.getBoundingClientRect();
+      const draggedMidY = draggedRect.top + draggedRect.height / 2;
+
+      let newIdx = dragState.currentIdx;
+      allRows.forEach((r, i) => {
+        if(r === dragState.row) return;
+        const rect = r.getBoundingClientRect();
+        const midY = rect.top + rect.height / 2;
+        const originalIdx = parseInt(r.getAttribute('data-idx'));
+        if(draggedMidY > midY && dragState.currentIdx < originalIdx){
+          newIdx = originalIdx;
+        } else if(draggedMidY < midY && dragState.currentIdx > originalIdx){
+          newIdx = originalIdx;
+        }
+      });
+
+      if(newIdx !== dragState.currentIdx){
+        // live-preview the swap visually without committing to state yet, by
+        // physically moving the DOM node — the real array reorder happens on drop
+        const container = queueListEl;
+        const rowsNow = Array.from(container.querySelectorAll('.draggable-row'));
+        const draggedNode = dragState.row;
+        const targetNode = rowsNow.find(r => parseInt(r.getAttribute('data-idx')) === newIdx);
+        if(targetNode){
+          if(newIdx > dragState.currentIdx){
+            container.insertBefore(draggedNode, targetNode.nextSibling);
+          } else {
+            container.insertBefore(draggedNode, targetNode);
+          }
+        }
+        dragState.currentIdx = newIdx;
+        dragState.row.style.transform = 'translateY(0px)';
+        dragState.startY = e.clientY;
+      }
+    }
+
+    function onPointerUp(){
+      if(!dragState) return;
+      const { startIdx, currentIdx, row } = dragState;
+      row.classList.remove('dragging');
+      row.style.transform = '';
+      row.style.zIndex = '';
+      dragState = null;
+      if(startIdx !== currentIdx){
+        reorderQueue(startIdx, currentIdx);
+      } else {
+        render(); // snap back / re-render to clean up any DOM drift from the live preview
+      }
+    }
+
+    // attach window-level listeners once per render call; harmless duplication is avoided
+    // by removing any previous listeners via the named function references below
+    window.removeEventListener('pointermove', window.__pbPointerMove || (() => {}));
+    window.removeEventListener('pointerup', window.__pbPointerUp || (() => {}));
+    window.__pbPointerMove = onPointerMove;
+    window.__pbPointerUp = onPointerUp;
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
   }
 
   function sendToRest(idx){
@@ -1308,7 +1730,9 @@
         const willFillNext = anyOpenCourt && runningCount + unitSize(unit) <= 4;
         runningCount += unitSize(unit);
         const row = document.createElement('div');
-        row.className = 'queue-row' + ((isPair || isGroup4) ? ' paired pair-group' : '');
+        row.className = 'queue-row draggable-row' + ((isPair || isGroup4) ? ' paired pair-group' : '');
+        row.setAttribute('draggable', 'true');
+        row.setAttribute('data-idx', idx);
         let displayName;
         if(isGroup4){
           displayName = unit.names.map((n, ni) => escapeHtml(n) + levelChip(unit.levels[ni])).join(', ');
@@ -1317,7 +1741,8 @@
         } else {
           displayName = escapeHtml(unit.names[0]) + levelChip(unit.levels[0]);
         }
-        row.innerHTML = '<span class="queue-pos">'+(idx+1)+'</span>' +
+        row.innerHTML = '<span class="drag-handle" aria-hidden="true">⠿</span>' +
+          '<span class="queue-pos">'+(idx+1)+'</span>' +
           '<span class="queue-name">'+displayName+
           (isGroup4 ? '<span class="pair-tag">locked group of 4</span>' : '') +
           (isPair ? '<span class="pair-tag">locked in</span>' : '') +
@@ -1327,6 +1752,7 @@
           '<button class="remove-btn" data-remove="'+idx+'" aria-label="'+(isGroup4 ? 'Unlock group' : 'Remove')+'" title="'+(isGroup4 ? 'Unlock — returns all 4 as solo entries' : 'Remove')+'">&times;</button>';
         queueListEl.appendChild(row);
       });
+      wireDragAndDrop();
       queueListEl.querySelectorAll('[data-remove]').forEach(btn => {
         btn.addEventListener('click', () => removeFromQueue(parseInt(btn.getAttribute('data-remove'))));
       });
@@ -1387,6 +1813,106 @@
     standingsWrap.innerHTML = html;
   }
 
+  function allKnownPlayerNames(){
+    const names = new Set();
+    matchHistory.forEach(m => { m.teamA.forEach(n => names.add(n)); m.teamB.forEach(n => names.add(n)); });
+    return Array.from(names).sort();
+  }
+
+  function syncHistoryFilterOptions(){
+    const currentValue = historyPlayerFilter.value;
+    const names = allKnownPlayerNames();
+    const existingValues = Array.from(historyPlayerFilter.options).map(o => o.value);
+    const wanted = [''].concat(names);
+    if(existingValues.length === wanted.length && existingValues.every((v, i) => v === wanted[i])) return;
+    historyPlayerFilter.innerHTML = '<option value="">All players — show game log</option>' +
+      names.map(n => '<option value="'+escapeHtml(n)+'">'+escapeHtml(n)+'</option>').join('');
+    if(names.includes(currentValue)) historyPlayerFilter.value = currentValue;
+  }
+
+  function formatMatchTime(iso){
+    const d = new Date(iso);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function renderGameLog(){
+    if(matchHistory.length === 0){
+      historyWrap.innerHTML = '<div class="empty-standings">No matches yet. Every foursome that hits the court gets logged here.</div>';
+      return;
+    }
+    const recent = matchHistory.slice().reverse(); // most recent first
+    let html = '<div class="history-list">';
+    recent.forEach(m => {
+      html += '<div class="history-row">' +
+        '<div class="history-meta">'+formatMatchTime(m.time)+' — Court '+(m.court+1)+'</div>' +
+        '<div class="history-teams">' +
+        '<span class="history-team">'+escapeHtml(m.teamA[0])+' &amp; '+escapeHtml(m.teamA[1])+'</span>' +
+        '<span class="history-vs">vs</span>' +
+        '<span class="history-team">'+escapeHtml(m.teamB[0])+' &amp; '+escapeHtml(m.teamB[1])+'</span>' +
+        '</div></div>';
+    });
+    html += '</div>';
+    historyWrap.innerHTML = html;
+  }
+
+  function renderPlayerLookup(playerName){
+    const games = matchHistory.filter(m => m.teamA.includes(playerName) || m.teamB.includes(playerName));
+    if(games.length === 0){
+      historyWrap.innerHTML = '<div class="empty-standings">'+escapeHtml(playerName)+' hasn\'t played a logged match yet.</div>';
+      return;
+    }
+
+    const teammateCounts = {};
+    const opponentCounts = {};
+    games.forEach(m => {
+      const onTeamA = m.teamA.includes(playerName);
+      const teammate = onTeamA ? m.teamA.find(n => n !== playerName) : m.teamB.find(n => n !== playerName);
+      const opponents = onTeamA ? m.teamB : m.teamA;
+      if(teammate) teammateCounts[teammate] = (teammateCounts[teammate] || 0) + 1;
+      opponents.forEach(o => { opponentCounts[o] = (opponentCounts[o] || 0) + 1; });
+    });
+
+    const allOthers = new Set([...Object.keys(teammateCounts), ...Object.keys(opponentCounts)]);
+    const rows = Array.from(allOthers).map(name => ({
+      name,
+      teammate: teammateCounts[name] || 0,
+      opponent: opponentCounts[name] || 0,
+      total: (teammateCounts[name] || 0) + (opponentCounts[name] || 0)
+    })).sort((a, b) => b.total - a.total);
+
+    const mostFrequent = rows[0];
+
+    let html = '<div class="lookup-summary">' +
+      '<span class="big-num">'+games.length+'</span> logged game'+(games.length === 1 ? '' : 's') +
+      (mostFrequent ? ' — most frequently with <strong>'+escapeHtml(mostFrequent.name)+'</strong> ('+mostFrequent.total+'x)' : '') +
+      '</div>';
+
+    html += '<div class="freq-table"><div class="freq-row head">' +
+      '<span class="freq-name">Player</span><span class="freq-num">Team</span><span class="freq-num">Vs</span><span class="freq-num">Total</span></div>';
+    rows.forEach(r => {
+      html += '<div class="freq-row">' +
+        '<span class="freq-name">'+escapeHtml(r.name)+'</span>' +
+        '<span class="freq-num">'+(r.teammate || '–')+'</span>' +
+        '<span class="freq-num">'+(r.opponent || '–')+'</span>' +
+        '<span class="freq-num">'+r.total+'</span>' +
+        '</div>';
+    });
+    html += '</div>';
+    historyWrap.innerHTML = html;
+  }
+
+  function renderHistory(){
+    syncHistoryFilterOptions();
+    const selected = historyPlayerFilter.value;
+    if(selected){
+      renderPlayerLookup(selected);
+    } else {
+      renderGameLog();
+    }
+  }
+
+  historyPlayerFilter.addEventListener('change', renderHistory);
+
   function renderStats(){
     const inQueue = queue.reduce((sum, u) => sum + unitSize(u), 0);
     const onCourt = courts.reduce((sum, c) => sum + (c ? c.slots.length : 0), 0);
@@ -1401,7 +1927,7 @@
 
   function saveSession(){
     try {
-      const snapshot = { courts, previews, queue, resting, records, requeue: requeueToggle.checked, autoFill: autoFillToggle.checked, balanced: balancedToggle.checked };
+      const snapshot = { courts, previews, queue, resting, records, matchHistory, missStreak, requeue: requeueToggle.checked, autoFill: autoFillToggle.checked, balanced: balancedToggle.checked };
       localStorage.setItem(SESSION_KEY, JSON.stringify(snapshot));
     } catch(e){ /* storage unavailable — session just won't persist across refresh */ }
   }
@@ -1417,6 +1943,8 @@
       if(s.queue) queue = s.queue;
       if(s.resting) resting = s.resting;
       if(s.records) records = s.records;
+      if(s.matchHistory) matchHistory = s.matchHistory;
+      if(s.missStreak) missStreak = s.missStreak;
       if(typeof s.requeue === 'boolean') requeueToggle.checked = s.requeue;
       if(typeof s.autoFill === 'boolean') autoFillToggle.checked = s.autoFill;
       if(typeof s.balanced === 'boolean') balancedToggle.checked = s.balanced;
@@ -1432,6 +1960,12 @@
     resting = [];
     records = {};
     history = [];
+    partnerHistory = {};
+    coOccurrence = {};
+    justFinishedBatches = [];
+    matchHistory = [];
+    lastCourtOccupants = [null, null];
+    missStreak = {};
     saveSession();
     render();
   }
@@ -1441,6 +1975,7 @@
     renderQueue();
     renderRest();
     renderStandings();
+    renderHistory();
     renderStats();
     undoBtn.disabled = history.length === 0;
     saveSession();
